@@ -131,6 +131,29 @@ impl Theme {
         self.mode == Mode::Dark
     }
 
+    /// 由当前浅色预设推一份深色版：只换中性色（底、纸、字、代码），保住用户挑的强调色与排版。
+    pub fn dark_variant(&self) -> Theme {
+        let mut t = self.clone();
+        t.mode = Mode::Dark;
+        t.bg_top = rgba(22, 26, 32, 1.0);
+        t.bg_bottom = rgba(14, 17, 22, 1.0);
+        t.text = rgba(226, 232, 240, 1.0);
+        t.heading = rgba(247, 250, 255, 1.0);
+        t.muted = rgba(150, 160, 172, 1.0);
+        t.link = mix(self.accent, rgba(255, 255, 255, 1.0), 0.35);
+        t.code_bg = rgba(31, 37, 45, 1.0);
+        t.code_text = rgba(220, 227, 236, 1.0);
+        t.tok_keyword = mix(self.tok_keyword, rgba(255, 255, 255, 1.0), 0.42);
+        t.tok_string = mix(self.tok_string, rgba(255, 255, 255, 1.0), 0.35);
+        t.tok_comment = rgba(146, 157, 170, 1.0);
+        t.tok_number = mix(self.tok_number, rgba(255, 255, 255, 1.0), 0.33);
+        t.tok_type = mix(self.tok_type, rgba(255, 255, 255, 1.0), 0.38);
+        t.quote_bg = rgba(255, 255, 255, 0.05);
+        t.shadow = (self.shadow + 0.12).min(0.5);
+        t.border_alpha = (self.border_alpha + 0.02).min(0.3);
+        t
+    }
+
     /// 用 JSON 覆盖任意字段（用户自定义主题就是靠这个）。
     pub fn apply_json(&mut self, v: &serde_json::Value) {
         let get_color = |k: &str| -> Option<Color> { v.get(k)?.as_str().and_then(parse_hex) };
@@ -433,7 +456,34 @@ fn write_settings(v: &serde_json::Value) {
     let _ = std::fs::write(settings_path(), serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
-/// 欢迎页的「最近打开」：从 settings.json 里读，最多 8 条，只留还在的文件。
+/// 单键写入（背景等），保留文件里其它键。
+pub fn set_setting(key: &str, v: serde_json::Value) {
+    let mut s = read_settings();
+    if let Some(o) = s.as_object_mut() {
+        o.insert(key.to_string(), v);
+    }
+    write_settings(&s);
+}
+
+/// 上次退出时的窗口大小（物理像素），下次一出来就是同一个尺寸。
+pub fn load_win_size() -> Option<(i32, i32)> {
+    let v = read_settings();
+    let w = v.get("win_w").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+    let h = v.get("win_h").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+    if w > 400 && h > 300 { Some((w, h)) } else { None }
+}
+
+/// 当前背景：`"default"`＝内置壁纸，`"none"`＝关掉，其它＝自定义图片的绝对路径。
+pub fn load_bg() -> String {
+    read_settings()
+        .get("bg")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+/// 欢迎页的「最近打开」：从 settings.json 里读，最多 24 条，只留还在的文件。
 pub fn load_recent() -> Vec<String> {
     let v = read_settings();
     let mut list: Vec<String> = v
@@ -442,7 +492,7 @@ pub fn load_recent() -> Vec<String> {
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     list.retain(|p| Path::new(p).exists());
-    list.truncate(8);
+    list.truncate(24);
     list
 }
 
@@ -453,7 +503,7 @@ pub fn add_recent(path: &Path) -> Vec<String> {
     list.retain(|x| x != &p);
     list.insert(0, p);
     list.retain(|x| Path::new(x).exists());
-    list.truncate(8);
+    list.truncate(24);
     let mut v = read_settings();
     if let Some(o) = v.as_object_mut() {
         o.insert("recent".into(), serde_json::json!(list));
@@ -505,9 +555,16 @@ pub fn ensure_theme_skeleton() {
 pub struct ThemeSet {
     pub all: Vec<Theme>,
     pub active: usize,
+    /// 用户是否选了「深色」。预设本身全是浅色，深色是在当前预设上推出来的。
+    pub dark: bool,
+    shown: Theme,
 }
 
 impl ThemeSet {
+    pub fn rebuild(&mut self) {
+        let light = self.all[self.active].clone();
+        self.shown = if self.dark { light.dark_variant() } else { light };
+    }
     pub fn load() -> ThemeSet {
         ensure_theme_skeleton();
         let mut all = presets();
@@ -542,6 +599,7 @@ impl ThemeSet {
 
         // settings.json：记住选中的主题 + 滑杆覆盖值
         let mut active = 0usize;
+        let mut dark = false;
         let mut overrides: Option<serde_json::Value> = None;
         if let Ok(txt) = std::fs::read_to_string(settings_path()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
@@ -550,24 +608,47 @@ impl ThemeSet {
                         active = i;
                     }
                 }
+                dark = v.get("dark").and_then(|x| x.as_bool()).unwrap_or(false);
                 overrides = v.get("overrides").cloned();
             }
         }
         if let Some(o) = overrides {
             all[active].apply_json(&o);
         }
-        ThemeSet { all, active }
+        let mut ts = ThemeSet { all, active, dark, shown: presets()[0].clone() };
+        ts.rebuild();
+        ts
     }
 
     pub fn cur(&self) -> &Theme {
-        &self.all[self.active]
+        &self.shown
     }
 
+    /// 选中第 i 个预设（不动深浅设置）。
+    pub fn set_active(&mut self, i: usize) {
+        if i < self.all.len() {
+            self.active = i;
+            self.rebuild();
+        }
+    }
+
+    pub fn set_dark(&mut self, dark: bool) {
+        self.dark = dark;
+        self.rebuild();
+    }
+
+    /// 改的是哪个预设（滑杆覆盖值要写回这个原始对象，而不是深色派生品）。
+    pub fn base_mut(&mut self) -> &mut Theme {
+        &mut self.all[self.active]
+    }
+
+    /// 深色模式下 save 的 overrides 应描述浅色底稿上的改动。
     pub fn save(&self, overrides: &serde_json::Value) {
         // 保留文件里其它键（比如 recent），只覆盖主题相关的两项
         let mut v = read_settings();
         if let Some(o) = v.as_object_mut() {
             o.insert("theme".into(), serde_json::json!(self.cur().name));
+            o.insert("dark".into(), serde_json::json!(self.dark));
             if overrides.is_null() {
                 o.remove("overrides");
             } else {

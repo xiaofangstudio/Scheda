@@ -5,3 +5,9 @@
 
 # 绿色版 exe 走 Release 分发，不入库
 /dist/*.exe
+
+# 开发过程截图：只保留早期入库的 5 张，新增的中间产物不入库
+/shots/
+
+# 背景图中间产物（入库的是 assets/背景.jpg，include_bytes 用）
+/assets/背景.png

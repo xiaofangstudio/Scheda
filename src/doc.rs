@@ -28,6 +28,8 @@ pub struct Doc {
     pub view_h: f32,
     pub toc: Vec<Toc>,
     pub copy_hits: Vec<(usize, R)>,
+    pub img_hits: Vec<ImgHit>,
+    pub table_hits: Vec<R>,
     pub key: (u32, u32, u32, u32),
     items: Vec<Item>,
     quotes: Vec<QuoteBox>,
@@ -107,6 +109,15 @@ struct Cell {
 struct ImageItem {
     bmp: Option<ID2D1Bitmap>,
     alt: String,
+    src: String,
+}
+
+/// 已画出来的图片位置（点一下进查看器）
+#[derive(Clone)]
+pub struct ImgHit {
+    pub r: R,
+    pub path: PathBuf,
+    pub bmp: Option<ID2D1Bitmap>,
 }
 
 // ————————————————————————————————————————————————————————————————
@@ -634,7 +645,7 @@ unsafe fn lay_image(c: &mut Lay, src: &str, alt: &str, x: f32, w: f32, quote: u3
         w: if bmp.is_some() { iw } else { w },
         quote,
         marker: None,
-        kind: ItemKind::Image(ImageItem { bmp, alt: alt.to_string() }),
+        kind: ItemKind::Image(ImageItem { bmp, alt: alt.to_string(), src: src.to_string() }),
     });
     c.y += h + 18.0 * s;
 }
@@ -649,7 +660,7 @@ impl App {
         let s = self.scale;
         let w = self.w as f32;
         let h = self.h as f32;
-        let toc_w = if self.toc_open && self.file.is_some() && w >= 1060.0 * s { 216.0 * s } else { 0.0 };
+        let toc_w = if self.toc_open && self.file.is_some() && w >= 860.0 * s { 216.0 * s } else { 0.0 };
         let gap = if toc_w > 0.0 { 14.0 * s } else { 0.0 };
         let left = 14.0 * s + toc_w + gap;
         let right = 14.0 * s;
@@ -727,6 +738,8 @@ impl App {
             view_h,
             toc: c.toc,
             copy_hits: Vec::new(),
+            img_hits: Vec::new(),
+            table_hits: Vec::new(),
             key,
             items: c.items,
             quotes: c.quotes,
@@ -739,12 +752,10 @@ impl App {
         let (sheet, toc_r, _vh) = self.doc_geo();
         let scroll = self.scroll;
 
-        // 纸面
-        let fill = if th.is_dark() {
-            alpha([1.0, 1.0, 1.0, 1.0], th.sheet_alpha)
-        } else {
-            theme::over([1.0, 1.0, 1.0, 1.0], th.bg_bottom, th.sheet_alpha.max(0.86))
-        };
+        // 纸面：中性磨砂玻璃。只用纯白/纯黑压亮度，不带任何色相，
+        // 壁纸被磨过之后照样透出来；「纸面」滑杆管的是这块玻璃的浓度。
+        let dens = ((th.sheet_alpha - 0.80) / 0.20).clamp(0.0, 1.0);
+        let fill = glass(th.is_dark(), if th.is_dark() { 0.40 + dens * 0.12 } else { 0.30 + dens * 0.12 });
         self.frost_panel(rt, b, th, sheet, th.radius, fill, true);
 
         let pad_x = self.pad_x();
@@ -771,6 +782,8 @@ impl App {
         }
 
         let mut copy_hits: Vec<(usize, R)> = Vec::new();
+        let mut img_hits: Vec<ImgHit> = Vec::new();
+        let base_dir = self.doc.as_ref().map(|d| d.base.clone()).unwrap_or_default();
         let n = self.doc.as_ref().map(|d| d.items.len()).unwrap_or(0);
         for i in 0..n {
             let it = match self.doc.as_ref().and_then(|d| d.items.get(i)) {
@@ -792,14 +805,14 @@ impl App {
                 }
                 ItemKind::Text(t) => {
                     for pill in t.code_bg.iter() {
-                        fill_round(rt, b, ix + pill.x, iy + pill.y, pill.w, pill.h, 4.0 * s, if th.is_dark() { alpha(th.code_bg, 0.85) } else { th.code_bg });
+                        fill_round(rt, b, ix + pill.x, iy + pill.y, pill.w, pill.h, 4.0 * s, th.code_bg);
                     }
                     b.SetColor(&cf(t.color));
                     let _ = rt.DrawTextLayout(pt(ix, iy), &t.layout, b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
                     let _ = t.size;
                 }
                 ItemKind::Code(cd) => {
-                    fill_round(rt, b, ix, iy, it.w, it.h, 10.0 * s, if th.is_dark() { alpha(th.code_bg, 0.72) } else { th.code_bg });
+                    fill_round(rt, b, ix, iy, it.w, it.h, 10.0 * s, th.code_bg);
                     stroke_round(rt, b, ix, iy, it.w, it.h, 10.0 * s, alpha(th.text, 0.09), 1.0);
                     // 语言标签
                     let label = if cd.lang.trim().is_empty() { "code" } else { cd.lang.trim() };
@@ -811,7 +824,7 @@ impl App {
                     if hot {
                         fill_round(rt, b, cr.x, cr.y, cr.w, cr.h, 10.0 * s, alpha(th.accent, 0.16));
                     }
-                    self.text_ui(rt, b, "复制", R { x: cr.x, y: cr.y, w: cr.w, h: cr.h }, 10.0 * s, 500, if hot { th.accent } else { alpha(th.muted, 0.8) }, DWRITE_TEXT_ALIGNMENT_CENTER);
+                    self.text_ui(rt, b, crate::lang::t("复制"), R { x: cr.x, y: cr.y, w: cr.w, h: cr.h }, 10.0 * s, 500, if hot { th.accent } else { alpha(th.muted, 0.8) }, DWRITE_TEXT_ALIGNMENT_CENTER);
                     copy_hits.push((i, cr));
                     for (k, line) in cd.lines.iter().enumerate() {
                         let ly = iy + cd.pad_top + k as f32 * cd.line_h;
@@ -858,6 +871,9 @@ impl App {
                     fill_r(rt, b, R { x: ix, y: iy, w: it.w, h: 1.0 }, alpha(th.text, 0.12));
                 }
                 ItemKind::Image(im) => {
+                    if let Some(p) = resolve_path(&base_dir, &im.src) {
+                        img_hits.push(ImgHit { r: R { x: ix, y: iy, w: it.w, h: it.h }, path: p, bmp: im.bmp.clone() });
+                    }
                     if let Some(bmp) = &im.bmp {
                         fill_round(rt, b, ix, iy, it.w, it.h, 8.0 * s, alpha(th.text, 0.05));
                         let _ = rt.DrawBitmap(
@@ -871,7 +887,7 @@ impl App {
                     } else {
                         fill_round(rt, b, ix, iy, it.w, it.h, 10.0 * s, alpha(th.text, if th.is_dark() { 0.04 } else { 0.03 }));
                         stroke_round(rt, b, ix, iy, it.w, it.h, 10.0 * s, alpha(th.text, 0.09), 1.0);
-                        let msg = if im.alt.trim().is_empty() { "零联网 · 远程图片已跳过".to_string() } else { format!("零联网 · 未加载：{}", im.alt) };
+                        let msg = if im.alt.trim().is_empty() { crate::lang::t("零联网 · 远程图片已跳过").to_string() } else { crate::lang::t("零联网 · 未加载：{}").replace("{}", &im.alt) };
                         self.text_ui(rt, b, &msg, R { x: ix, y: iy + it.h * 0.5 - 11.0 * s, w: it.w, h: 22.0 * s }, 11.5 * s, 400, alpha(th.muted, 0.85), DWRITE_TEXT_ALIGNMENT_CENTER);
                     }
                 }
@@ -918,26 +934,39 @@ impl App {
 
         if let Some(d) = self.doc.as_mut() {
             d.copy_hits = copy_hits;
+            d.img_hits = img_hits;
         }
 
-        // 滚动条
+        // 滚动条（可拖：轨道命中区比画出来的宽，好点）
+        self.sb_track = R::default();
+        self.sb_thumb = R::default();
         if let Some(d) = self.doc.as_ref() {
             let maxs = (d.height + pad_top + 24.0 * s - sheet.h).max(0.0);
             if maxs > 1.0 {
-                let track_x = sheet.x + sheet.w - 18.0 * s;
-                let track_y = sheet.y + 14.0 * s;
-                let track_h = sheet.h - 28.0 * s;
-                fill_round(rt, b, track_x, track_y, 4.0 * s, track_h, 2.0 * s, alpha(th.text, 0.05));
+                let track_x = sheet.x + sheet.w - 20.0 * s;
+                let track_y = sheet.y + 12.0 * s;
+                let track_h = sheet.h - 24.0 * s;
+                self.sb_track = R { x: track_x, y: track_y, w: 14.0 * s, h: track_h };
+                fill_round(rt, b, track_x + 3.0 * s, track_y, 5.0 * s, track_h, 2.5 * s, alpha(th.text, 0.05));
                 let thumb_h = ((sheet.h * sheet.h) / (sheet.h + maxs)).max(46.0 * s).min(track_h);
                 let t = (scroll / maxs).clamp(0.0, 1.0);
                 let ty = track_y + (track_h - thumb_h) * t;
-                fill_round(rt, b, track_x, ty, 4.0 * s, thumb_h, 2.0 * s, alpha(th.accent, 0.42));
+                let hot_sb = self.sb_drag;
+                let a = if hot_sb { 0.62 } else { 0.42 };
+                fill_round(rt, b, track_x + 2.5 * s, ty, 6.0 * s, thumb_h, 3.0 * s, alpha(th.accent, a));
+                self.sb_thumb = R { x: track_x + 1.0 * s, y: ty, w: 9.0 * s, h: thumb_h };
             }
         }
 
         // 目录
         if let Some(tr) = toc_r {
             self.paint_toc(rt, b, th, tr, sheet);
+        } else {
+            self.toc_entries.clear();
+            self.toc_panel = R::default();
+            self.toc_track = R::default();
+            self.toc_thumb = R::default();
+            self.toc_max = 0.0;
         }
     }
 
@@ -950,17 +979,16 @@ impl App {
             .unwrap_or_default();
         if entries.is_empty() {
             self.toc_entries.clear();
+            self.toc_track = R::default();
+            self.toc_thumb = R::default();
+            self.toc_max = 0.0;
             return;
         }
         let want_h = (58.0 * s + entries.len() as f32 * 26.0 * s + 12.0 * s).min(r.h);
         let r = R { h: want_h, ..r };
-        let fill = if th.is_dark() {
-            alpha([1.0, 1.0, 1.0, 1.0], 0.08)
-        } else {
-            theme::over([1.0, 1.0, 1.0, 1.0], th.bg_bottom, 0.94)
-        };
+        let fill = glass(th.is_dark(), if th.is_dark() { 0.30 } else { 0.26 });
         self.frost_panel(rt, b, th, r, th.radius, fill, true);
-        self.text_ui(rt, b, "目录", R { x: r.x + 18.0 * s, y: r.y + 16.0 * s, w: 120.0 * s, h: 22.0 * s }, 12.5 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
+        self.text_ui(rt, b, crate::lang::t("目录"), R { x: r.x + 18.0 * s, y: r.y + 16.0 * s, w: 120.0 * s, h: 22.0 * s }, 12.5 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
         fill_r(rt, b, R { x: r.x + 14.0 * s, y: r.y + 44.0 * s, w: r.w - 28.0 * s, h: 1.0 }, alpha(th.text, 0.08));
 
         let cur = self.scroll + 50.0 * s;
@@ -971,19 +999,44 @@ impl App {
             }
         }
 
-        let mut y = r.y + 56.0 * s;
-        let bottom = r.y + r.h - 12.0 * s;
+        let vtop = r.y + 56.0 * s;
+        let vh = (r.h - 68.0 * s).max(0.0);
+        let content = entries.len() as f32 * 26.0 * s;
+        self.toc_max = (content - vh).max(0.0);
+        // 目录跟着正文走：当前章节在哪，目录就把它滚到可视区里来
+        // （手指正在拖目录时别抢，其它时候一律自动跟随）
+        if !self.toc_drag && self.toc_max > 1.0 {
+            let row_h = 26.0 * s;
+            let idx_top = active as f32 * row_h;
+            let idx_bot = idx_top + row_h;
+            if idx_top < self.toc_scroll + row_h {
+                self.toc_scroll = (idx_top - row_h * 0.5).max(0.0);
+                self.toc_scroll_t = self.toc_scroll;
+            } else if idx_bot > self.toc_scroll + vh {
+                self.toc_scroll = (idx_bot - vh + row_h * 0.5).min(self.toc_max);
+                self.toc_scroll_t = self.toc_scroll;
+            }
+        }
+        self.toc_scroll = self.toc_scroll.clamp(0.0, self.toc_max);
+        self.toc_scroll_t = self.toc_scroll_t.clamp(0.0, self.toc_max);
+        self.toc_panel = r;
+        let mut y = vtop - self.toc_scroll;
+        let bottom = vtop + vh;
         let mut hits: Vec<R> = Vec::new();
         rt.PushAxisAlignedClip(&rectf(r.x + 2.0, r.y + 46.0 * s, r.w - 4.0, r.h - 48.0 * s), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         for (i, e) in entries.iter().enumerate() {
             if y + 26.0 * s > bottom {
                 break;
             }
+            if y < vtop - 26.0 * s {
+                y += 26.0 * s;
+                continue;
+            }
             let indent = 16.0 + (e.0.saturating_sub(1) as f32) * 10.0;
             let row = R { x: r.x + 10.0 * s, y, w: r.w - 20.0 * s, h: 26.0 * s };
             if i == active {
-                fill_round(rt, b, row.x, row.y + 2.0 * s, row.w, row.h - 4.0 * s, 7.0 * s, alpha(th.accent, 0.10));
-                fill_round(rt, b, row.x, row.y + 7.0 * s, 2.5 * s, row.h - 14.0 * s, 1.25 * s, alpha(th.accent, 0.85));
+                fill_round(rt, b, row.x, row.y + 2.0 * s, row.w, row.h - 4.0 * s, 7.0 * s, alpha(th.accent, 0.17));
+                fill_round(rt, b, row.x, row.y + 6.0 * s, 3.0 * s, row.h - 12.0 * s, 1.5 * s, alpha(th.accent, 0.95));
             }
             let col = if i == active { th.heading } else { alpha(th.text, 0.78) };
             let size = if e.0 <= 1 { 12.5 * s } else { 11.8 * s };
@@ -1001,18 +1054,34 @@ impl App {
             y += 26.0 * s;
         }
         rt.PopAxisAlignedClip();
+
+        // 目录自己的滚动条（条目多到装不下才出现）
+        self.toc_track = R::default();
+        self.toc_thumb = R::default();
+        if self.toc_max > 1.0 && vh > 40.0 * s {
+            let tx = r.x + r.w - 10.0 * s;
+            self.toc_track = R { x: tx - 3.0 * s, y: vtop, w: 10.0 * s, h: vh };
+            fill_round(rt, b, tx, vtop, 3.0 * s, vh, 1.5 * s, alpha(th.text, 0.05));
+            let th_h = (vh * vh / content).max(34.0 * s).min(vh);
+            let t = (self.toc_scroll / self.toc_max).clamp(0.0, 1.0);
+            let ty = vtop + (vh - th_h) * t;
+            fill_round(rt, b, tx, ty, 3.0 * s, th_h, 1.5 * s, alpha(th.accent, if self.toc_drag { 0.62 } else { 0.38 }));
+            self.toc_thumb = R { x: tx - 2.0 * s, y: ty, w: 8.0 * s, h: th_h };
+        }
         let _ = sheet;
         self.toc_entries = hits;
     }
 
     pub(crate) unsafe fn scroll_to(&mut self, y: f32) {
-        let (_, _, vh) = self.doc_geo();
-        let (_, _, _) = self.doc_geo();
         let s = self.scale;
-        let sheet_h = vh;
-        let maxs = self.doc.as_ref().map(|d| (d.height + 34.0 * s + 24.0 * s - sheet_h).max(0.0)).unwrap_or(0.0);
-        self.scroll_t = (y - 46.0 * s).clamp(0.0, maxs);
-        SetTimer(Some(self.hwnd), 1, 8, None);
+        let (_, _, vh) = self.doc_geo();
+        let maxs = self.doc.as_ref().map(|d| (d.height + 34.0 * s + 24.0 * s - vh).max(0.0)).unwrap_or(0.0);
+        // 目录点击是"跳过去"，不是"滑过去"：直接把 scroll 和 scroll_t 同时到位，
+        // 不会出现点了没反应、要等动画走完的情况。
+        let target = (y - 34.0 * s).clamp(0.0, maxs);
+        self.scroll_t = target;
+        self.scroll = target;
+        InvalidateRect(Some(self.hwnd), None, false);
     }
 }
 
@@ -1037,6 +1106,12 @@ impl Doc {
     pub(crate) fn copy_hit(&self, x: f32, y: f32) -> Option<usize> {
         self.copy_hits.iter().find(|(_, r)| r.hit(x, y)).map(|(i, _)| *i)
     }
+    pub(crate) fn image_hit(&self, x: f32, y: f32) -> Option<(PathBuf, Option<ID2D1Bitmap>)> {
+        self.img_hits.iter().find(|h| h.r.hit(x, y)).map(|h| (h.path.clone(), h.bmp.clone()))
+    }
 }
+
+
+
 
 

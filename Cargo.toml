@@ -1,6 +1,6 @@
 [package]
 name = "scheda"
-version = "1.1.0"
+version = "1.5.0"
 edition = "2021"
 description = "Scheda — 一台电脑上最轻的 Markdown 查看器"
 authors = ["小方工作室"]
@@ -26,6 +26,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Registry",
+    "Win32_Security",
 ] }
 pulldown-cmark = { version = "0.13", default-features = false }
 serde_json = "1"
