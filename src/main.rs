@@ -32,12 +32,17 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::Dialogs::*;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Input::Ime::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_numerics::{Matrix3x2, Vector2};
 
 const TITLE_H: f32 = 54.0;
 const WM_MOUSE_LEAVE: u32 = 0x02A3;
+// 输入法：组字窗 / 候选窗要钉在光标上，否则 Windows 默认把候选窗丢到窗口左上角
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+const WM_IME_COMPOSITION: u32 = 0x010F;
 
 fn main() {
     unsafe {
@@ -245,8 +250,6 @@ struct Gfx {
     dwrite: IDWriteFactory,
     rt: Option<ID2D1DCRenderTarget>,
     solid: Option<ID2D1SolidColorBrush>,
-    noise: Option<ID2D1Bitmap>,
-    noise_brush: Option<ID2D1BitmapBrush>,
     fmts: std::collections::HashMap<(String, u32, u32, bool), IDWriteTextFormat>,
     /// 正文排版用的格式（带行距），键里含行距与基线
     doc_fmts: std::collections::HashMap<(String, u32, u32, bool, u32, u32), IDWriteTextFormat>,
@@ -262,6 +265,9 @@ struct Gfx {
     frost_key: (i32, i32, u64, u8),
     /// 模糊图相对屏幕的缩放：模糊图 1 像素 = 屏幕 1/frost_k
     frost_k: f32,
+    /// 背景图的小尺寸像素缓存（cover 采样 + 盒式模糊的输入），换背景才重解
+    frost_src_key: String,
+    frost_src: Option<(u32, u32, Vec<u8>)>,
     layer: Option<ID2D1Layer>,
 }
 
@@ -328,8 +334,6 @@ impl Gfx {
             dwrite,
             rt: None,
             solid: None,
-            noise: None,
-            noise_brush: None,
             fmts: std::collections::HashMap::new(),
             doc_fmts: std::collections::HashMap::new(),
             ascents: std::collections::HashMap::new(),
@@ -341,6 +345,8 @@ impl Gfx {
             frost: None,
             frost_key: (0, 0, 0, 0),
             frost_k: 1.0,
+            frost_src_key: String::new(),
+            frost_src: None,
             layer: None,
         })
     }
@@ -369,8 +375,6 @@ impl Gfx {
                     self.frost_key = (0, 0, 0, 0);
                     self.rt = Some(rt);
                     self.solid = None;
-                    self.noise = None;
-                    self.noise_brush = None;
                     self.fmts.clear();
                     self.doc_fmts.clear();
                     self.ascents.clear();
@@ -390,26 +394,6 @@ impl Gfx {
         if self.solid.is_none() {
             self.solid = rt.CreateSolidColorBrush(&cf([1.0, 1.0, 1.0, 1.0]), None).ok();
         }
-        if self.noise.is_none() {
-            self.noise = make_noise(&rt).ok();
-            if let Some(n) = self.noise.as_ref() {
-                let bprops = D2D1_BITMAP_BRUSH_PROPERTIES {
-                    extendModeX: D2D1_EXTEND_MODE_WRAP,
-                    extendModeY: D2D1_EXTEND_MODE_WRAP,
-                    interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                };
-                let props = D2D1_BITMAP_PROPERTIES {
-                    pixelFormat: D2D1_PIXEL_FORMAT {
-                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                    },
-                    dpiX: 96.0,
-                    dpiY: 96.0,
-                };
-                let bp = D2D1_BRUSH_PROPERTIES { opacity: 1.0, transform: ident() };
-                self.noise_brush = rt.CreateBitmapBrush(n, Some(&bprops), Some(&bp)).ok();
-            }
-        }
         Some(rt)
     }
 
@@ -420,8 +404,9 @@ impl Gfx {
         self.frost_key = (0, 0, 0, 0);
     }
 
-    /// 把整窗背景做一张低分辨率 + 多级降采样的模糊图，磨砂面板直接抠这块来画。
-    /// k：模糊图 1px = 屏幕 1/k。三级 1/3 → 1/6 → 1/12，等价于大半径高斯。
+    /// 把整窗背景做一张低分辨率的模糊图，磨砂面板直接抠这块来画。
+    /// 模糊半径只由 `frost`（磨砂程度）决定：0 = 几乎不散、1 = 粗砂。
+    /// 模糊只是邻近像素求平均——色相和平均亮度原样保留，绝不给背景加任何滤镜。
     unsafe fn build_frost(
         &mut self,
         rt: &ID2D1RenderTarget,
@@ -432,8 +417,10 @@ impl Gfx {
         bottom: Color,
         veil: f32,
         dark: bool,
+        frost: f32,
     ) {
-        let hk = format!("{}|{:.0}|{:.0}|{}|{}", key, w, h, dark as u8, veil.to_bits() as u64);
+        let frost = frost.clamp(0.0, 1.0);
+        let hk = format!("{}|{:.0}|{:.0}|{}|{}|{}", key, w, h, dark as u8, veil.to_bits() as u64, frost.to_bits() as u64);
         let hash = {
             use std::hash::{Hash, Hasher};
             let mut hh = std::collections::hash_map::DefaultHasher::new();
@@ -448,54 +435,58 @@ impl Gfx {
         self.frost_key = kk;
 
         let px_fmt = D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED };
-        let mut cur: Option<ID2D1Bitmap> = None;
-        // 第一级：1/2 屏幕，直接从壁纸缩下来；再 1/4、1/8 —— 停在 1/8，
-        // 既糊得均匀，又留得住大片色块（1/12 会把颜色全糊平，玻璃就没味道了）
-        let mut k = 0.5f32;
-        for level in 0..3 {
-            let bw = ((w * k).round() as u32).max(2);
-            let bh = ((h * k).round() as u32).max(2);
-            let size = D2D_SIZE_U { width: bw, height: bh };
-            let brt = match rt.CreateCompatibleRenderTarget(None, Some(&size), Some(&px_fmt), D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE) {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            brt.BeginDraw();
-            // 底：主题渐变铺满
-            let bwf = bw as f32;
-            let bhf = bh as f32;
-            if let Ok(g) = linear(&brt, &[(0.0, top), (1.0, bottom)], (0.0, 0.0), (bwf * 0.3, bhf)) {
-                brt.FillRectangle(&rectf(0.0, 0.0, bwf, bhf), &g);
-            }
-            if let Some(prev) = cur.as_ref() {
-                // 上一级整张缩进来：线性采样本身就是一次平滑，三级叠加够糊
-                let _ = brt.DrawBitmap(prev, Some(&rectf(0.0, 0.0, bwf, bhf)), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&rectf(0.0, 0.0, prev.GetSize().width, prev.GetSize().height)));
-            } else if !key.is_empty() {
-                if let Some(img) = self.bg_bitmap(rt, key) {
-                    let sz = img.GetSize();
-                    if sz.width > 1.0 && sz.height > 1.0 {
-                        let cov = (bwf / sz.width).max(bhf / sz.height);
-                        let dw = sz.width * cov;
-                        let dh = sz.height * cov;
-                        let dest = rectf((bwf - dw) * 0.5, (bhf - dh) * 0.5, dw, dh);
-                        let _ = brt.DrawBitmap(&img, Some(&dest), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&rectf(0.0, 0.0, sz.width, sz.height)));
-                    }
-                }
-            }
-            if veil > 0.001 {
-                if let Ok(bb) = brt.CreateSolidColorBrush(&cf(alpha(top, veil)), None) {
-                    brt.FillRectangle(&rectf(0.0, 0.0, bwf, bhf), &bb);
-                }
-            }
-            let _ = brt.EndDraw(None, None);
-            match brt.GetBitmap() {
-                Ok(b) => cur = Some(b),
-                Err(_) => return,
-            }
-            k *= 0.5;
+        // 模糊图 1 像素 = 屏幕 1/8；在这个分辨率上揉一遍盒式模糊，
+        // 半径越大，玻璃后的光散得越开，也就是「磨砂程度」。
+        let k = 1.0 / 4.0;
+        let bw = ((w * k).round() as u32).max(2);
+        let bh = ((h * k).round() as u32).max(2);
+        let size = D2D_SIZE_U { width: bw, height: bh };
+        let brt = match rt.CreateCompatibleRenderTarget(None, Some(&size), Some(&px_fmt), D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        brt.BeginDraw();
+        let bwf = bw as f32;
+        let bhf = bh as f32;
+        if let Ok(g) = linear(&brt, &[(0.0, top), (1.0, bottom)], (0.0, 0.0), (bwf * 0.3, bhf)) {
+            brt.FillRectangle(&rectf(0.0, 0.0, bwf, bhf), &g);
         }
-        self.frost = cur;
-        self.frost_k = 1.0 / 8.0;
+        let mut washed = false;
+        if !key.is_empty() {
+            // 背景图只解一次、缩成小图缓存；窗口每变一次尺寸只做「采样 + 盒式模糊」
+            if self.frost_src_key != key {
+                self.frost_src = wic_small_source(key, 512);
+                self.frost_src_key = key.to_string();
+            }
+            let src = self.frost_src.as_ref().map(|(sw, sh, p)| (*sw, *sh, p.clone()));
+            if let Some((sw, sh, srcpx)) = src {
+                let mut px = cover_resample(&srcpx, sw, sh, bw, bh);
+                // 半径：0 → 1px（1/8 图上约等于 8 屏幕像素，几乎只是轻微柔化）
+                //       1 → 10px（约 80 屏幕像素，厚磨砂，背景细节全散开）
+                let r = (3.0 + frost * 18.0).round() as usize;
+                box_blur_rgba(&mut px, bw as usize, bh as usize, r);
+                box_blur_rgba(&mut px, bw as usize, bh as usize, r);
+                let props = D2D1_BITMAP_PROPERTIES { pixelFormat: px_fmt, dpiX: 96.0, dpiY: 96.0 };
+                if let Ok(bmp) = rt.CreateBitmap(size, Some(px.as_ptr() as *const c_void), bw * 4, &props) {
+                    let full = rectf(0.0, 0.0, bwf, bhf);
+                    let _ = brt.DrawBitmap(&bmp, Some(&full), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, Some(&full));
+                    washed = true;
+                }
+            }
+        }
+        // 薄雾只留给「没有背景图、纯主题渐变」的兜底场景；有背景图时一律不盖，颜色保持原样
+        if !washed && veil > 0.001 {
+            if let Ok(bb) = brt.CreateSolidColorBrush(&cf(alpha(top, veil)), None) {
+                brt.FillRectangle(&rectf(0.0, 0.0, bwf, bhf), &bb);
+            }
+        }
+        let _ = brt.EndDraw(None, None);
+        let bmp = match brt.GetBitmap() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        self.frost = Some(bmp);
+        self.frost_k = k;
     }
 
     /// 背景图：WIC 解码一次，key 不变就一直复用这张位图。
@@ -619,36 +610,109 @@ impl Gfx {
     }
 }
 
-unsafe fn make_noise(rt: &ID2D1RenderTarget) -> Result<ID2D1Bitmap> {
-    const N: usize = 256;
-    let mut px = vec![0u8; N * N * 4];
-    let mut seed: u32 = 0x9e37_79b9;
-    for i in 0..(N * N) {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        let a = (seed >> 8) & 0xFF;
-        let a = (a as f32 / 255.0).powf(1.6);
-        let v = (a * 255.0) as u8;
-        px[i * 4] = 255;
-        px[i * 4 + 1] = 255;
-        px[i * 4 + 2] = 255;
-        px[i * 4 + 3] = v.min(140);
+fn box_blur_rgba(px: &mut Vec<u8>, w: usize, h: usize, r: usize) {
+    if r == 0 || w < 2 || h < 2 {
+        return;
     }
-    let props = D2D1_BITMAP_PROPERTIES {
-        pixelFormat: D2D1_PIXEL_FORMAT {
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-        },
-        dpiX: 96.0,
-        dpiY: 96.0,
+    let n = 2 * r + 1;
+    let mut tmp = vec![0u8; px.len()];
+    // 横
+    for y in 0..h {
+        let row = y * w * 4;
+        for c in 0..4 {
+            for x in 0..w {
+                let mut sum = 0u32;
+                for k in 0..n {
+                    let sx = (x as isize + k as isize - r as isize).clamp(0, w as isize - 1) as usize;
+                    sum += px[row + sx * 4 + c] as u32;
+                }
+                tmp[row + x * 4 + c] = (sum / n as u32) as u8;
+            }
+        }
+    }
+    // 纵
+    for x in 0..w {
+        for c in 0..4 {
+            for y in 0..h {
+                let mut sum = 0u32;
+                for k in 0..n {
+                    let sy = (y as isize + k as isize - r as isize).clamp(0, h as isize - 1) as usize;
+                    sum += tmp[(sy * w + x) * 4 + c] as u32;
+                }
+                px[(y * w + x) * 4 + c] = (sum / n as u32) as u8;
+            }
+        }
+    }
+}
+
+unsafe fn wic_small_source(key: &str, max_side: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let f: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let frame = if key == "@builtin" {
+        let bytes: &'static [u8] = include_bytes!("../assets/背景.jpg");
+        let stream = f.CreateStream().ok()?;
+        stream.InitializeFromMemory(bytes).ok()?;
+        let dec = f.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnLoad).ok()?;
+        dec.GetFrame(0).ok()?
+    } else {
+        if !std::path::Path::new(key).exists() {
+            return None;
+        }
+        let dec = f
+            .CreateDecoderFromFilename(&HSTRING::from(key), None, GENERIC_READ, WICDecodeMetadataCacheOnLoad)
+            .ok()?;
+        dec.GetFrame(0).ok()?
     };
-    rt.CreateBitmap(
-        D2D_SIZE_U { width: N as u32, height: N as u32 },
-        Some(px.as_ptr() as *const c_void),
-        (N * 4) as u32,
-        &props,
-    )
+    let mut sw = 0u32;
+    let mut sh = 0u32;
+    frame.GetSize(&mut sw, &mut sh).ok()?;
+    if sw < 2 || sh < 2 {
+        return None;
+    }
+    let k = (max_side as f32 / sw as f32).min(max_side as f32 / sh as f32).min(1.0);
+    let dw = ((sw as f32 * k).round() as u32).max(2);
+    let dh = ((sh as f32 * k).round() as u32).max(2);
+    let scaler = f.CreateBitmapScaler().ok()?;
+    scaler.Initialize(&frame, dw, dh, WICBitmapInterpolationModeFant).ok()?;
+    let conv = f.CreateFormatConverter().ok()?;
+    let src: IWICBitmapSource = scaler.cast().ok()?;
+    conv.Initialize(&src, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)
+        .ok()?;
+    let mut px = vec![0u8; (dw * dh * 4) as usize];
+    conv.CopyPixels(std::ptr::null(), dw * 4, &mut px).ok()?;
+    Some((dw, dh, px))
+}
+
+/// 把缓存的小图按 cover 采样到目标尺寸（双线性，不放大成马赛克）
+fn cover_resample(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    if sw < 1 || sh < 1 || dw < 1 || dh < 1 {
+        return out;
+    }
+    let cov = (dw as f32 / sw as f32).max(dh as f32 / sh as f32);
+    let ox = ((sw as f32 * cov) - dw as f32) * 0.5;
+    let oy = ((sh as f32 * cov) - dh as f32) * 0.5;
+    for y in 0..dh {
+        let sy = ((y as f32 + 0.5 + oy) / cov - 0.5).clamp(0.0, sh as f32 - 1.0);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(sh as usize - 1);
+        let fy = sy - y0 as f32;
+        for x in 0..dw {
+            let sx = ((x as f32 + 0.5 + ox) / cov - 0.5).clamp(0.0, sw as f32 - 1.0);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(sw as usize - 1);
+            let fx = sx - x0 as f32;
+            let i = ((y * dw + x) * 4) as usize;
+            for c in 0..4 {
+                let a = src[(y0 * sw as usize + x0) * 4 + c] as f32;
+                let b = src[(y0 * sw as usize + x1) * 4 + c] as f32;
+                let cc = src[(y1 * sw as usize + x0) * 4 + c] as f32;
+                let d = src[(y1 * sw as usize + x1) * 4 + c] as f32;
+                let v = (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (cc * (1.0 - fx) + d * fx) * fy;
+                out[i + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
 }
 
 fn text_w(s: &str) -> Vec<u16> {
@@ -766,7 +830,7 @@ struct App {
     chip_reset: R,
     preset_rects: Vec<R>,
     swatch_rects: Vec<R>,
-    slider_rects: [R; 7],
+    slider_rects: [R; 8],
     font_rects: [R; 3],
     mode_rects: [R; 2],
     bg_toggle: R,
@@ -897,7 +961,7 @@ impl App {
             chip_reset: R::default(),
             preset_rects: Vec::new(),
             swatch_rects: Vec::new(),
-            slider_rects: [R::default(); 7],
+            slider_rects: [R::default(); 8],
             font_rects: [R::default(); 3],
             mode_rects: [R::default(); 2],
             bg_toggle: R::default(),
@@ -1671,10 +1735,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                     }
+                    app.ime_at_caret();
                     InvalidateRect(Some(hwnd), None, false);
                 }
             }
             LRESULT(0)
+        }
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION => {
+            if let Some(app) = app_mut(hwnd) {
+                if app.editing {
+                    app.ime_at_caret();
+                    InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_IME_ENDCOMPOSITION => {
+            if let Some(app) = app_mut(hwnd) {
+                if app.editing {
+                    app.ime_at_caret();
+                    InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
             if let Some(app) = app_mut(hwnd) {
@@ -1818,9 +1901,9 @@ impl App {
         }
     }
 
-    /// 一层磨砂玻璃：先抠一块背景模糊图铺进圆角里，再压一层半透明着色 + 噪点 + 高光 + 发丝边 + 外投影。
+    /// 一层磨砂玻璃：圆角里铺一块「散开」的背景，不染色、不加噪点，只保留高光、发丝边和外投影。
     /// `tint` 的 RGB 是玻璃颜色，alpha 是这层玻璃有多crate::lang::t("厚")（越小越透，背景越明显）。
-    unsafe fn frost_panel(&self, rt: &ID2D1RenderTarget, b: &ID2D1SolidColorBrush, th: &Theme, r: R, rad: f32, tint: Color, shadow: bool) {
+    unsafe fn frost_panel(&self, rt: &ID2D1RenderTarget, b: &ID2D1SolidColorBrush, th: &Theme, r: R, rad: f32, tint: Color, shadow: bool, paper: f32) {
         let s = self.scale;
         let rad = rad.min(r.w * 0.5).min(r.h * 0.5);
         if shadow && th.shadow > 0.01 {
@@ -1849,10 +1932,14 @@ impl App {
                     };
                     rt.PushLayer(&params, layer);
                     let fk = self.gfx.frost_k;
+                    // 「玻璃透明度」：只决定这层散光盖住背后多少，不改变任何颜色——
+                    // 0.70 时还能隐约看见背景的形状，1.0 时整块被散光铺满。
+                    let view = ((0.68 - th.glass_alpha) / 0.60).clamp(0.0, 1.0);
+                    let a = (1.0 - view * 0.25).clamp(0.75, 1.0);
                     let _ = rt.DrawBitmap(
                         frost,
                         Some(&rectf(r.x, r.y, r.w, r.h)),
-                        1.0,
+                        a,
                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                         Some(&rectf(r.x * fk, r.y * fk, r.w * fk, r.h * fk)),
                     );
@@ -1862,41 +1949,17 @@ impl App {
             }
         }
 
-        // ② 着色：一层上亮下暗的玻璃色（alpha 越小，背后的颜色越明显）
-        if frosted {
-            let a0 = (tint[3] * 1.04).min(0.94);
-            let a1 = (tint[3] * 0.90).min(0.92);
-            if let Ok(g) = linear(rt, &[(0.0, alpha(tint, a0)), (1.0, alpha(tint, a1))], (r.x, r.y), (r.x, r.y + r.h)) {
-                rt.FillRoundedRectangle(&rrect(r.x, r.y, r.w, r.h, rad), &g);
-            }
-        } else {
+        if !frosted {
             fill_round(rt, b, r.x, r.y, r.w, r.h, rad, alpha(tint, 0.96));
+        } else if paper > 0.01 {
+            // 阅读 / 编辑的「纸面」：散光之上再罩一层很淡的中性纸色（不带色相），把黑字托起来；
+            // 玻璃卡片 paper = 0，就是纯散光、一点不染
+            fill_round(rt, b, r.x, r.y, r.w, r.h, rad, alpha(tint, (tint[3] * paper).clamp(0.0, 0.95)));
         }
 
-        // ②b 玻璃厚度：贴边上沿压一道淡阴影、下沿反一点光，卡片才像"一块"而不是"一张纸"
-        {
-            let sh = if th.is_dark() { [0.0, 0.0, 0.0, 0.20] } else { [0.06, 0.10, 0.16, 0.10] };
-            let d = 10.0 * s;
-            if let Ok(g) = linear(rt, &[(0.0, sh), (1.0, alpha(sh, 0.0))], (r.x, r.y), (r.x, r.y + d)) {
-                rt.FillRoundedRectangle(&rrect(r.x, r.y, r.w, r.h, rad), &g);
-            }
-            let bl = if th.is_dark() { [1.0, 1.0, 1.0, 0.03] } else { [1.0, 1.0, 1.0, 0.10] };
-            if let Ok(g) = linear(rt, &[(0.0, alpha(bl, 0.0)), (1.0, bl)], (r.x, r.y + r.h - d * 1.6), (r.x, r.y + r.h)) {
-                rt.FillRoundedRectangle(&rrect(r.x, r.y, r.w, r.h, rad), &g);
-            }
-        }
-
-        // ③ 细噪点：模拟玻璃表面的粗糙
-        if let Some(nb) = self.gfx.noise_brush.clone() {
-            nb.SetOpacity(0.055 * th.frost);
-            rt.FillRoundedRectangle(&rrect(r.x, r.y, r.w, r.h, rad), &nb);
-        }
-        // ④ 上边缘一道高光 + 左下角一点更亮的反光
-        let hi = if th.is_dark() { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.62] };
+        // 玻璃边缘：上沿一道极细高光，右下留一条发丝边。只是边，不往玻璃里面涂任何颜色。
+        let hi = if th.is_dark() { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.55] };
         fill_round(rt, b, r.x + rad * 0.5, r.y + 0.5 * s, (r.w - rad).max(1.0), 1.0 * s, 0.5, hi);
-        if let Ok(g) = linear(rt, &[(0.0, [1.0, 1.0, 1.0, if th.is_dark() { 0.05 } else { 0.14 }]), (1.0, [1.0, 1.0, 1.0, 0.0])], (r.x, r.y + r.h * 0.55), (r.x, r.y + r.h)) {
-            rt.FillRoundedRectangle(&rrect(r.x, r.y, r.w, r.h, rad), &g);
-        }
         // ⑤ 发丝边
         stroke_round(
             rt,
@@ -1982,14 +2045,13 @@ impl App {
 
         self.chrome();
 
-        // 1) 纯色底 + 极轻的磨砂噪点（不做任何渐变）
+        // 1) 纯色底（不做任何渐变）
         self.build_bg(&rt, &th, w, h);
         if let Some(bg) = self.gfx.bg.as_ref() {
             rt.FillRectangle(&rectf(0.0, 0.0, w, h), &bg.base);
         }
-        // 1.5) 背景图：cover 铺满 + 一层薄雾，正文才压得住
+        // 1.5) 背景图：cover 铺满。原图直接画，不叠雾、不加噪点、不改色
         let key = self.bg_key();
-        let veil = if th.is_dark() { 0.55 } else { 0.06 };
         if !key.is_empty() {
             if let Some(img) = self.gfx.bg_bitmap(&rt, &key) {
                 let sz = img.GetSize();
@@ -2006,16 +2068,11 @@ impl App {
                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                         Some(&sr),
                     );
-                    fill_r(&rt, &b, R { x: 0.0, y: 0.0, w, h }, alpha(th.bg_top, veil));
                 }
             }
         }
-        if let Some(nb) = self.gfx.noise_brush.clone() {
-            nb.SetOpacity(0.030 * th.frost);
-            rt.FillRectangle(&rectf(0.0, 0.0, w, h), &nb);
-        }
-        // 1.6) 给磨砂玻璃准备一张背景模糊图（尺寸/背景/主题变了才重做）
-        self.gfx.build_frost(&rt, w, h, &key, th.bg_top, th.bg_bottom, if key.is_empty() { 0.0 } else if th.is_dark() { 0.22 } else { 0.02 }, th.is_dark());
+        // 1.6) 磨砂玻璃用的背景散光图（尺寸/背景/主题/磨砂程度变了才重做）
+        self.gfx.build_frost(&rt, w, h, &key, th.bg_top, th.bg_bottom, if key.is_empty() { 0.06 } else { 0.0 }, th.is_dark(), th.frost);
 
         // 2) 内容
         if self.editing {
@@ -2106,9 +2163,9 @@ impl App {
         let cw = ((w - m * 2.0 - gap) * 0.5).max(240.0);
         let lc = R { x: m, y: top, w: cw, h: ch };
         let rc = R { x: m + cw + gap, y: top, w: cw, h: ch };
-        let fillc = glass(th.is_dark(), if th.is_dark() { 0.34 } else { 0.31 });
-        self.frost_panel(rt, b, th, lc, th.radius, fillc, true);
-        self.frost_panel(rt, b, th, rc, th.radius, fillc, true);
+        let fillc = glass(th.is_dark(), if th.is_dark() { 0.40 } else { 0.42 });
+        self.frost_panel(rt, b, th, lc, th.radius, fillc, true, 1.0);
+        self.frost_panel(rt, b, th, rc, th.radius, fillc, true, 1.0);
 
         // —— 左卡：拖文件进来 + 快捷键（竖排，一行一个）
         let ix = lc.x + 26.0 * s;
@@ -2509,7 +2566,7 @@ impl App {
         let m = 26.0 * s;
         let top = TITLE_H * s + 22.0 * s;
         let inner_w = w - m * 2.0;
-        let card_fill = glass(th.is_dark(), if th.is_dark() { 0.34 } else { 0.31 });
+        let card_fill = glass(th.is_dark(), if th.is_dark() { 0.40 } else { 0.42 });
 
         // 标题
         self.text_ui(rt, b, crate::lang::t("设置"), R { x: m, y: top, w: 260.0 * s, h: 34.0 * s }, 21.0 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -2590,7 +2647,7 @@ impl App {
         let rh = 44.0 * s;
         let lh = (64.0 * s + 7.0 * (rh + 6.0 * s) + 12.0 * s).min(avail_h);
         let lr = R { x: m, y: cy, w: lw, h: lh };
-        self.frost_panel(rt, b, th, lr, th.radius, card_fill, true);
+        self.frost_panel(rt, b, th, lr, th.radius, card_fill, true, 1.0);
         let lp = 20.0 * s;
         let lcx = lr.x + lp;
         let lcw = lr.w - lp * 2.0;
@@ -2667,7 +2724,7 @@ impl App {
         let ph = h - py - 22.0 * s;
         if ph >= 148.0 * s {
             let prr = R { x: m, y: py, w: lw, h: ph };
-            self.frost_panel(rt, b, th, prr, th.radius, card_fill, true);
+            self.frost_panel(rt, b, th, prr, th.radius, card_fill, true, 1.0);
             let pb = prr.y + prr.h - 10.0 * s;
             self.text_ui(rt, b, crate::lang::t("预览"), R { x: lcx, y: prr.y + 16.0 * s, w: lcw, h: 20.0 * s }, 11.5 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
             let ty = prr.y + 44.0 * s;
@@ -2725,7 +2782,7 @@ impl App {
         // 强调色卡按内容定高（两列 7 个滑杆），省下的高度全给字体卡，窗口再矮也不会画到屏幕外
         let c1h = (298.0 * s).min((rem - 132.0 * s).max(240.0 * s));
         let c1 = R { x: rx, y: cy, w: rw, h: c1h };
-        self.frost_panel(rt, b, th, c1, th.radius, card_fill, true);
+        self.frost_panel(rt, b, th, c1, th.radius, card_fill, true, 1.0);
         self.text_ui(rt, b, crate::lang::t("强调色"), R { x: rcx, y: c1.y + 18.0 * s, w: rcw, h: 20.0 * s }, 12.0 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
         self.text_ui(rt, b, theme::to_hex(th.accent).to_uppercase().as_str(), R { x: rcx + rcw - 70.0 * s, y: c1.y + 18.0 * s, w: 70.0 * s, h: 20.0 * s }, 9.5 * s, 500, alpha(th.muted, 0.9), DWRITE_TEXT_ALIGNMENT_TRAILING);
 
@@ -2751,16 +2808,17 @@ impl App {
         fill_r(rt, b, R { x: rcx, y: c1.y + 88.0 * s, w: rcw, h: 1.0 }, alpha(th.text, 0.07));
         self.text_ui(rt, b, crate::lang::t("形态"), R { x: rcx, y: c1.y + 102.0 * s, w: rcw, h: 20.0 * s }, 12.0 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
 
-        let items: [(String, String, f32); 7] = [
+        let items: [(String, String, f32); 8] = [
             (crate::lang::t("圆角").into(), format!("{:.0}", th.radius), (th.radius - 8.0) / 28.0),
-            (crate::lang::t("磨砂").into(), format!("{:.0}%", th.frost * 100.0), th.frost),
+            (crate::lang::t("磨砂程度").into(), format!("{:.0}%", th.frost * 100.0), th.frost),
             (crate::lang::t("字号").into(), format!("{:.0}", th.font_size), (th.font_size - 13.0) / 9.0),
             (crate::lang::t("行距").into(), format!("{:.2}", th.line_height), (th.line_height - 1.35) / 1.05),
             (crate::lang::t("段距").into(), format!("{:.0}", th.para_gap), (th.para_gap - 2.0) / 42.0),
             (crate::lang::t("阴影").into(), format!("{:.0}%", th.shadow * 100.0), (th.shadow - 0.06) / 0.39),
             (crate::lang::t("纸面").into(), format!("{:.0}%", th.sheet_alpha * 100.0), ((th.sheet_alpha - 0.82) / 0.18).clamp(0.0, 1.0)),
+            (crate::lang::t("玻璃透明度").into(), format!("{:.0}%", ((0.68 - th.glass_alpha) / 0.60 * 100.0).clamp(0.0, 100.0)), ((0.68 - th.glass_alpha) / 0.60).clamp(0.0, 1.0)),
         ];
-        // 七个滑杆排成两列（左 4 右 3），矮窗口也不会把滑杆挤到卡片外面
+        // 八个滑杆排成两列（每列 4 个），矮窗口也不会把滑杆挤到卡片外面
         let colw = (rcw - 48.0 * s) * 0.5;
         let rowh = 40.0 * s;
         for (i, (name, val, t)) in items.iter().enumerate() {
@@ -2789,7 +2847,7 @@ impl App {
         let c2h = (avail_h - gapv * 2.0 - c3h - c1h).max(150.0 * s);
         let c2 = R { x: rx, y: c2y, w: rw, h: c2h };
         if c2y + c2h <= h - 4.0 * s {
-            self.frost_panel(rt, b, th, c2, th.radius, card_fill, true);
+            self.frost_panel(rt, b, th, c2, th.radius, card_fill, true, 1.0);
             self.text_ui(rt, b, crate::lang::t("字体"), R { x: rcx, y: c2.y + 18.0 * s, w: rcw, h: 20.0 * s }, 12.0 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
             self.text_ui(rt, b, crate::lang::t("点一下换下一款"), R { x: rcx + rcw - 110.0 * s, y: c2.y + 18.0 * s, w: 110.0 * s, h: 20.0 * s }, 9.5 * s, 400, alpha(th.muted, 0.85), DWRITE_TEXT_ALIGNMENT_TRAILING);
             let fams: [(&str, usize); 4] = [(crate::lang::t("界面"), 0), (crate::lang::t("正文"), 1), (crate::lang::t("代码"), 2), (crate::lang::t("背景"), 3)];
@@ -3057,9 +3115,13 @@ impl App {
                 let v = 0.06 + t * 0.39;
                 self.set_override("shadow", serde_json::json!((v * 100.0).round() / 100.0));
             }
-            _ => {
+            6 => {
                 let v = 0.82 + t * 0.18;
                 self.set_override("sheet_alpha", serde_json::json!((v * 100.0).round() / 100.0));
+            }
+            _ => {
+                let v = 0.68 - t * 0.60;
+                self.set_override("glass_alpha", serde_json::json!((v * 100.0).round() / 100.0));
             }
         }
         InvalidateRect(Some(self.hwnd), None, false);
@@ -3623,6 +3685,47 @@ impl App {
         self.edit_scroll_t = self.edit_scroll;
     }
 
+    /// 把输入法的组字窗、候选窗钉到自绘光标上。
+    /// 自绘编辑器不接这一步的话，Windows 会把候选窗丢在窗口左上角，打字时像"没用输入法"。
+    unsafe fn ime_at_caret(&mut self) {
+        if !self.editing {
+            return;
+        }
+        // 对照开关：设了 SCHEDA_NOIME 就退回"不接输入法"的老行为，用来验证候选窗是不是钉在光标上
+        if std::env::var_os("SCHEDA_NOIME").is_some() {
+            return;
+        }
+        let (_, text) = self.edit_geo();
+        let s = self.scale;
+        let x = self.edit_caret_px.0.max(text.x);
+        let y = text.y + self.edit_caret_px.1 - self.edit_scroll;
+        let h = self.edit_caret_px.2.max(12.0 * s);
+        let himc = ImmGetContext(self.hwnd);
+        if himc.0.is_null() {
+            return;
+        }
+        let cf = COMPOSITIONFORM {
+            dwStyle: CFS_POINT,
+            ptCurrentPos: POINT { x: x as i32, y: y as i32 },
+            rcArea: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+        };
+        let _ = ImmSetCompositionWindow(himc, &cf);
+        let mut cand = CANDIDATEFORM {
+            dwIndex: 0,
+            dwStyle: CFS_EXCLUDE,
+            ptCurrentPos: POINT { x: x as i32, y: (y + h) as i32 },
+            rcArea: RECT {
+                left: (x - 4.0) as i32,
+                top: y as i32,
+                right: (x + 4.0) as i32,
+                bottom: (y + h) as i32,
+            },
+        };
+        let _ = ImmSetCandidateWindow(himc, &cand);
+        let _ = ImmReleaseContext(self.hwnd, himc);
+        let _ = &mut cand;
+    }
+
     fn edit_geo(&self) -> (R, R) {
         let s = self.scale;
         let sheet = R {
@@ -3658,8 +3761,8 @@ impl App {
     unsafe fn paint_edit(&mut self, rt: &ID2D1RenderTarget, b: &ID2D1SolidColorBrush, th: &Theme, _w: f32, h: f32) {
         let s = self.scale;
         let (sheet, text) = self.edit_geo();
-        let fill = glass(th.is_dark(), if th.is_dark() { 0.42 } else { 0.34 });
-        self.frost_panel(rt, b, th, sheet, th.radius, fill, true);
+        let fill = glass(th.is_dark(), if th.is_dark() { 0.52 } else { 0.72 });
+        self.frost_panel(rt, b, th, sheet, th.radius, fill, true, 1.0);
 
         let name = self.title();
         self.text_ui(rt, b, &name, R { x: sheet.x + 24.0 * s, y: sheet.y + 16.0 * s, w: sheet.w - 240.0 * s, h: 26.0 * s }, 15.0 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -3811,7 +3914,7 @@ impl App {
         // 顶部工具条（毛玻璃）
         let bar_w = (560.0 * s).min(w - 40.0 * s);
         let bar = R { x: (w - bar_w) * 0.5, y: 24.0 * s, w: bar_w, h: 46.0 * s };
-        self.frost_panel(rt, b, th, bar, 23.0 * s, glass(th.is_dark(), 0.30), true);
+        self.frost_panel(rt, b, th, bar, 23.0 * s, glass(th.is_dark(), 0.30), true, 0.0);
         let zoom_txt = format!("{:.0}%", zoom * 100.0);
         self.text_ui(rt, b, &zoom_txt, R { x: bar.x + 18.0 * s, y: bar.y, w: 56.0 * s, h: bar.h }, 11.5 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
         let label = if name.chars().count() > 18 { format!("{}…", name.chars().take(17).collect::<String>()) } else { name.clone() };

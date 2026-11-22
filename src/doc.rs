@@ -755,8 +755,8 @@ impl App {
         // 纸面：中性磨砂玻璃。只用纯白/纯黑压亮度，不带任何色相，
         // 壁纸被磨过之后照样透出来；「纸面」滑杆管的是这块玻璃的浓度。
         let dens = ((th.sheet_alpha - 0.80) / 0.20).clamp(0.0, 1.0);
-        let fill = glass(th.is_dark(), if th.is_dark() { 0.40 + dens * 0.12 } else { 0.30 + dens * 0.12 });
-        self.frost_panel(rt, b, th, sheet, th.radius, fill, true);
+        let fill = glass(th.is_dark(), if th.is_dark() { 0.42 + dens * 0.16 } else { 0.52 + dens * 0.30 });
+        self.frost_panel(rt, b, th, sheet, th.radius, fill, true, 1.0);
 
         let pad_x = self.pad_x();
         let pad_top = 34.0 * s;
@@ -986,8 +986,8 @@ impl App {
         }
         let want_h = (58.0 * s + entries.len() as f32 * 26.0 * s + 12.0 * s).min(r.h);
         let r = R { h: want_h, ..r };
-        let fill = glass(th.is_dark(), if th.is_dark() { 0.30 } else { 0.26 });
-        self.frost_panel(rt, b, th, r, th.radius, fill, true);
+        let fill = glass(th.is_dark(), if th.is_dark() { 0.44 } else { 0.50 });
+        self.frost_panel(rt, b, th, r, th.radius, fill, true, 1.0);
         self.text_ui(rt, b, crate::lang::t("目录"), R { x: r.x + 18.0 * s, y: r.y + 16.0 * s, w: 120.0 * s, h: 22.0 * s }, 12.5 * s, 600, th.heading, DWRITE_TEXT_ALIGNMENT_LEADING);
         fill_r(rt, b, R { x: r.x + 14.0 * s, y: r.y + 44.0 * s, w: r.w - 28.0 * s, h: 1.0 }, alpha(th.text, 0.08));
 

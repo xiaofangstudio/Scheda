@@ -99,7 +99,8 @@ pub struct Theme {
     pub sheet_alpha: f32,   // 阅读纸面（磨砂板）
     pub panel_alpha: f32,   // 侧栏 / 面板
     pub border_alpha: f32,  // 发丝边
-    pub frost: f32,         // 磨砂噪点强度 0..1
+    pub frost: f32,         // 磨砂程度 0..1（直接映射成模糊半径，越大越糊）
+    pub glass_alpha: f32,   // 玻璃涂层浓度（透明度）：0 透、1 实
     pub radius: f32,        // 圆角（逻辑像素）
     pub shadow: f32,        // 投影强度
 
@@ -233,6 +234,9 @@ impl Theme {
         if let Some(x) = get_f("frost") {
             self.frost = x.clamp(0.0, 1.0);
         }
+        if let Some(x) = get_f("glass_alpha") {
+            self.glass_alpha = x.clamp(0.05, 0.95);
+        }
         if let Some(x) = get_f("radius") {
             self.radius = x.clamp(0.0, 40.0);
         }
@@ -280,7 +284,8 @@ fn base() -> Theme {
         sheet_alpha: 0.94,
         panel_alpha: 0.92,
         border_alpha: 0.12,
-        frost: 0.35,
+        frost: 0.5,
+        glass_alpha: 0.34,
         radius: 18.0,
         shadow: 0.22,
         text: rgba(25, 32, 40, 1.0),
@@ -532,6 +537,7 @@ pub fn ensure_theme_skeleton() {
   "panel_alpha": 0.95,
   "border_alpha": 0.10,
   "frost": 0.28,
+  "glass_alpha": 0.34,
   "radius": 18,
   "shadow": 0.20,
   "font_size": 16,

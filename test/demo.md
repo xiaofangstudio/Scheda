@@ -34,7 +34,7 @@
 
 ## 代码
 
-```rust
+```copper
 use std::io;
 
 /// 一段带注释的 Rust
